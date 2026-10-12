@@ -7,25 +7,18 @@ const path = require('path');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./swagger');
 const replayHooks = require('../observability/replay_hooks');
+const log = require('../sdk/logging');
+const config = require('../sdk/configuration');
+const { storeArtifact } = require('./bucket_client');
 
 const app = express();
 app.use(express.json());
 
-const log = (trace_id, execution_id, service_name, status, message) => {
-  console.log(JSON.stringify({
-    timestamp: new Date().toISOString(),
-    trace_id,
-    execution_id,
-    service_name,
-    status,
-    message
-  }));
-};
-
-const PORT = process.env.PORT || 3003;
-const SARATHI_URL = process.env.SARATHI_URL || 'http://localhost:3001';
-const BUCKET_URL = process.env.BUCKET_URL || 'http://localhost:3004';
-const BUCKET_TIMEOUT_MS = parseInt(process.env.BUCKET_TIMEOUT_MS) || 15000;
+const PORT = config.get('service.port');
+const SARATHI_URL = config.get('sarathi.url');
+const BUCKET_URL = config.get('bucket.url');
+const BUCKET_TIMEOUT_MS = config.get('bucket.timeoutMs');
+const BUCKET_REQUESTER_ID = config.get('bucket.requesterId');
 
 let jwksCache = null;
 let jwksCacheExpiry = 0;
@@ -46,10 +39,10 @@ async function fetchJwks() {
     return jwksCache;
   } catch (err) {
     if (jwksCache) {
-      log(null, null, 'execution', 'warn', 'JWKS fetch failed, using stale cache');
+      log.warn('JWKS fetch failed, using stale cache', { service: 'execution', status: 'warn', trace_id: null, execution_id: null });
       return jwksCache;
     }
-    log(null, null, 'execution', 'error', 'Sarathi unavailable - cannot fetch JWKS');
+    log.error('Sarathi unavailable - cannot fetch JWKS', { service: 'execution', status: 'error', trace_id: null, execution_id: null });
     throw new Error('Sarathi authority unavailable');
   }
 }
@@ -89,7 +82,7 @@ function verifyEdDSAToken(token, jwk) {
 const validateBridgeSignature = async (req, res, next) => {
   const bridgeSignature = req.body.bridge_signature;
   if (!bridgeSignature) {
-    log(null, null, 'execution', 'error', 'Missing bridge signature');
+    log.error('Missing bridge signature', { service: 'execution', status: 'error', trace_id: null, execution_id: null });
     return res.status(401).json({ error: 'Unauthorized: Missing bridge signature' });
   }
 
@@ -127,7 +120,7 @@ const validateBridgeSignature = async (req, res, next) => {
     replayHooks.hookServiceTransition(decoded.trace_id, decoded.execution_id, 'execution', 'pending', 'validated');
     next();
   } catch (err) {
-    log(null, null, 'execution', 'error', `Bridge signature validation failed: ${err.message}`);
+    log.error(`Bridge signature validation failed: ${err.message}`, { service: 'execution', status: 'error', trace_id: null, execution_id: null });
     return res.status(401).json({ error: 'Unauthorized: Invalid bridge signature' });
   }
 };
@@ -137,7 +130,7 @@ const enforceImmutableIds = (req, res, next) => {
   const tokenExecutionId = req.bridgeTokenData.execution_id;
 
   if (req.body.trace_id !== tokenTraceId || req.body.execution_id !== tokenExecutionId) {
-    log(tokenTraceId, tokenExecutionId, 'execution', 'error', 'ID mutation detected');
+    log.error('ID mutation detected', { service: 'execution', status: 'error', trace_id: tokenTraceId, execution_id: tokenExecutionId });
     return res.status(400).json({ error: 'ID mutation forbidden' });
   }
 
@@ -265,7 +258,7 @@ app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) 
   const { trace_id, execution_id } = req;
   const { workload } = req.body;
 
-  log(trace_id, execution_id, 'execution', 'info', 'Executing workload');
+  log.info('Executing workload', { service: 'execution', status: 'info', trace_id, execution_id });
   replayHooks.hookServiceTransition(trace_id, execution_id, 'execution', 'validated', 'processing');
 
   try {
@@ -273,39 +266,42 @@ app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) 
     const result = await executeWorkload(workload, trace_id, execution_id);
     const duration = Date.now() - startTime;
 
-    const artifact = {
-      trace_id,
-      execution_id,
-      result,
-      timestamp: new Date().toISOString(),
-      duration_ms: duration
-    };
+    const artifactTimestamp = new Date().toISOString();
 
-    log(trace_id, execution_id, 'execution', 'info', 'Storing artifact in Bucket');
+    log.info('Storing artifact in Bucket', { service: 'execution', status: 'info', trace_id, execution_id });
     replayHooks.hookServiceTransition(trace_id, execution_id, 'execution', 'processing', 'storing');
 
-    const bucketResponse = await axios.post(
-      `${BUCKET_URL}/store`,
-      artifact,
-      {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: BUCKET_TIMEOUT_MS
-      }
-    );
+    const bucketResponse = await storeArtifact({
+      bucketUrl: BUCKET_URL,
+      timeoutMs: BUCKET_TIMEOUT_MS,
+      requesterId: BUCKET_REQUESTER_ID,
+      traceId: trace_id,
+      executionId: execution_id,
+      result,
+      timestampUtc: artifactTimestamp,
+      durationMs: duration
+    });
 
-    log(trace_id, execution_id, 'execution', 'success', 'Execution completed, artifact stored');
-    replayHooks.hookExecutionResponse(trace_id, execution_id, 'completed', { artifact_location: bucketResponse.data.location, duration_ms: duration });
+    const storedArtifact = bucketResponse.data || {};
+    const artifactLocation = storedArtifact.artifact_id
+      ? `artifacts/${trace_id}/${execution_id}`
+      : null;
+
+    log.info('Execution completed, artifact stored', { service: 'execution', status: 'success', trace_id, execution_id });
+    replayHooks.hookExecutionResponse(trace_id, execution_id, 'completed', { artifact_location: artifactLocation, artifact_id: storedArtifact.artifact_id, duration_ms: duration });
     replayHooks.hookServiceTransition(trace_id, execution_id, 'execution', 'storing', 'completed');
     res.json({
       trace_id,
       execution_id,
       status: 'completed',
       result,
-      artifact_location: bucketResponse.data.location,
+      artifact_location: artifactLocation,
+      artifact_id: storedArtifact.artifact_id,
+      artifact_hash: storedArtifact.hash,
       duration_ms: duration
     });
   } catch (err) {
-    log(trace_id, execution_id, 'execution', 'error', `Execution failed: ${err.message}`);
+    log.error(`Execution failed: ${err.message}`, { service: 'execution', status: 'error', trace_id, execution_id });
     replayHooks.hookExecutionFailure(trace_id, execution_id, err, err.response ? 'bucket' : 'execution');
     replayHooks.hookServiceTransition(trace_id, execution_id, 'execution', 'processing', 'failed');
 
@@ -328,7 +324,7 @@ async function executeWorkload(workload, trace_id, execution_id) {
       const participant = require(path.resolve(participantPath));
       return await participant.executeWorkload(workload, trace_id, execution_id);
     } catch (err) {
-      log(trace_id, execution_id, 'execution', 'error', `Execution participant failed: ${err.message}`);
+      log.error(`Execution participant failed: ${err.message}`, { service: 'execution', status: 'error', trace_id, execution_id });
       throw err;
     }
   }
@@ -337,17 +333,17 @@ async function executeWorkload(workload, trace_id, execution_id) {
 }
 
 const server = app.listen(PORT, () => {
-  log(null, null, 'execution', 'info', `Execution Service running on port ${PORT}`);
+  log.info(`Execution Service running on port ${PORT}`, { service: 'execution', status: 'info', trace_id: null, execution_id: null });
 });
 
 function gracefulShutdown(signal) {
-  log(null, null, 'execution', 'info', `Received ${signal}, shutting down gracefully`);
+  log.info(`Received ${signal}, shutting down gracefully`, { service: 'execution', status: 'info', trace_id: null, execution_id: null });
   server.close(() => {
-    log(null, null, 'execution', 'info', 'Server closed');
+    log.info('Server closed', { service: 'execution', status: 'info', trace_id: null, execution_id: null });
     process.exit(0);
   });
   setTimeout(() => {
-    log(null, null, 'execution', 'warn', 'Forced shutdown after timeout');
+    log.warn('Forced shutdown after timeout', { service: 'execution', status: 'warn', trace_id: null, execution_id: null });
     process.exit(1);
   }, 5000);
 }
