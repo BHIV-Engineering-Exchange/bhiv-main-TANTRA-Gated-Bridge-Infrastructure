@@ -127,7 +127,6 @@ services:
       - NODE_ENV=production
       - PORT=3003
       - SARATHI_URL=http://tantra-sarathi:3001
-      - BUCKET_URL=http://tantra-bucket:3004
     volumes:
       - execution-outputs:/app/execution/outputs
     networks:
