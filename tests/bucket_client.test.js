@@ -3,17 +3,22 @@ const axios = require('axios');
 const { storeArtifact } = require('../services/execution/bucket_client');
 
 async function run() {
-  const originalGet = axios.get;
   const originalPost = axios.post;
   const calls = [];
 
-  axios.get = async (url, options) => {
-    calls.push({ method: 'GET', url, options });
-    return { data: { last_hash: 'current-chain-head' } };
-  };
   axios.post = async (url, body, options) => {
     calls.push({ method: 'POST', url, body, options });
-    return { data: { success: true, data: { artifact_id: 'exec-1', hash: 'bucket-hash' } } };
+    return {
+      status: 201,
+      data: {
+        location: 'artifacts/trace-1/exec-1',
+        trace_id: 'trace-1',
+        execution_id: 'exec-1',
+        hash: 'bucket-hash',
+        verified: true,
+        persistent: true
+      }
+    };
   };
 
   try {
@@ -28,22 +33,18 @@ async function run() {
       durationMs: 3
     });
 
-    assert.strictEqual(response.success, true);
-    assert.strictEqual(calls[0].url, 'http://bucket/bucket/latest-hash');
-    assert.strictEqual(calls[1].url, 'http://bucket/bucket/artifacts/write');
-    assert.strictEqual(calls[1].body.requester_id, 'tantra-core');
-    assert.strictEqual(calls[1].body.integration_id, 'core');
-    assert.strictEqual(calls[1].body.artifact.artifact_id, 'exec-1');
-    assert.strictEqual(calls[1].body.artifact.trace_id, 'trace-1');
-    assert.strictEqual(calls[1].body.artifact.parent_hash, 'current-chain-head');
-    assert.deepStrictEqual(calls[1].body.artifact.payload, {
-      workload: 'test',
-      output: 'Processed test',
-      hash: 'result-hash',
+    assert.strictEqual(response.status, 201);
+    assert.strictEqual(response.data.location, 'artifacts/trace-1/exec-1');
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].url, 'http://bucket/store');
+    assert.deepStrictEqual(calls[0].body, {
+      trace_id: 'trace-1',
+      execution_id: 'exec-1',
+      result: { workload: 'test', output: 'Processed test', hash: 'result-hash' },
+      timestamp: '2026-10-12T00:00:00.000Z',
       duration_ms: 3
     });
   } finally {
-    axios.get = originalGet;
     axios.post = originalPost;
   }
 }
