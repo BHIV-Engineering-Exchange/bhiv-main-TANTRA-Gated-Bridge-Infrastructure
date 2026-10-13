@@ -283,10 +283,12 @@ app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) 
     });
 
     const storedArtifact = bucketResponse.data || {};
-    const artifactLocation = storedArtifact.location || `artifacts/${trace_id}/${execution_id}`;
+    const artifactLocation = storedArtifact.artifact_id
+      ? `artifacts/${trace_id}/${execution_id}`
+      : null;
 
     log.info('Execution completed, artifact stored', { service: 'execution', status: 'success', trace_id, execution_id });
-    replayHooks.hookExecutionResponse(trace_id, execution_id, 'completed', { artifact_location: artifactLocation, artifact_id: execution_id, duration_ms: duration });
+    replayHooks.hookExecutionResponse(trace_id, execution_id, 'completed', { artifact_location: artifactLocation, artifact_id: storedArtifact.artifact_id, duration_ms: duration });
     replayHooks.hookServiceTransition(trace_id, execution_id, 'execution', 'storing', 'completed');
     res.json({
       trace_id,
@@ -294,7 +296,7 @@ app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) 
       status: 'completed',
       result,
       artifact_location: artifactLocation,
-      artifact_id: execution_id,
+      artifact_id: storedArtifact.artifact_id,
       artifact_hash: storedArtifact.hash,
       duration_ms: duration
     });
