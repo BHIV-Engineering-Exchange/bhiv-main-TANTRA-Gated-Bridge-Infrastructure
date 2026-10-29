@@ -40,6 +40,19 @@ class Configuration {
         enabled: process.env.INSIGHTFLOW_ENABLED === 'true',
         timeoutMs: parseInt(process.env.INSIGHTFLOW_TIMEOUT_MS) || 10000
       },
+      masterdb: {
+        url: process.env.MASTERDB_URL || 'http://localhost:8080',
+        timeoutMs: parseInt(process.env.MASTERDB_TIMEOUT_MS) || 10000,
+        applicationId: process.env.MASTERDB_APPLICATION_ID || 'app-tantra-gated-bridge',
+        defaultCapabilityId: process.env.MASTERDB_CAPABILITY_ID || 'cap-mangrove-monitoring',
+        defaultPurpose: process.env.MASTERDB_PURPOSE || 'environmental_monitoring'
+      },
+      vajra: {
+        url: process.env.VAJRA_URL || 'http://localhost:8080',
+        secret: process.env.VAJRA_TANTRA_SECRET || '',
+        timeoutMs: parseInt(process.env.VAJRA_TIMEOUT_MS) || 5000,
+        enabled: process.env.VAJRA_PROVENANCE_ENABLED === 'true'
+      },
       jwt: {
         expiry: process.env.JWT_EXPIRY || '1h',
         expiryMs: parseInt(process.env.JWT_EXPIRY_MS) || 3600000

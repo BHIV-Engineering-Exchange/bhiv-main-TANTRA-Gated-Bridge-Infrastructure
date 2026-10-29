@@ -1,10 +1,10 @@
+try { require('dotenv').config(); } catch {}
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const keyPersistence = require('./key_persistence');
-require('dotenv').config();
 
 const app = express();
 app.use(express.json());
@@ -31,6 +31,7 @@ const tokenCleanupInterval = setInterval(() => {
     }
   }
 }, 60000);
+if (tokenCleanupInterval && tokenCleanupInterval.unref) tokenCleanupInterval.unref();
 
 const keys = keyPersistence.loadOrGenerateKeys();
 const RSA_PRIVATE_KEY = keys.rsa.privateKey;
@@ -44,7 +45,7 @@ log(null, null, 'sarathi', 'info', keys.generated ? 'Generated new RSA + Ed25519
 log(null, null, 'sarathi', 'info', `RSA KID: ${rsaKid}, Ed25519 KID: ${ed25519Kid}`);
 
 const ISSUER = process.env.ISSUER || 'tantra-sarathi';
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || process.env.SARATHI_PORT || 3001;
 
 function base64urlEncode(buf) {
   return Buffer.from(buf).toString('base64url');
@@ -66,6 +67,10 @@ function signEdDSAToken(claims, keyid) {
   return signingInput + '.' + base64urlEncode(signature);
 }
 
+function signRS256Token(claims, keyid) {
+  return jwt.sign(claims, RSA_PRIVATE_KEY, { algorithm: 'RS256', keyid });
+}
+
 function generateRsaJwk() {
   const publicKeyObj = crypto.createPublicKey(RSA_PRIVATE_KEY);
   const jwk = publicKeyObj.export({ format: 'jwk' });
@@ -84,6 +89,29 @@ function generateEd25519Jwk() {
   return jwk;
 }
 
+// Authoritative Service Principal Registry & Role Policy
+// Callers CANNOT grant themselves arbitrary or elevated privileges.
+const TRUSTED_SERVICE_POLICIES = {
+  'tantra-execution': {
+    allowedRoles: ['ecosystem-reader'],
+    defaultRoles: ['ecosystem-reader'],
+    allowedAudiences: ['tantra-bridge', 'masterdb'],
+    defaultAudience: 'tantra-bridge'
+  },
+  'tantra-bridge': {
+    allowedRoles: ['ecosystem-reader'],
+    defaultRoles: ['ecosystem-reader'],
+    allowedAudiences: ['tantra-bridge', 'masterdb'],
+    defaultAudience: 'tantra-bridge'
+  },
+  'tantra-sdk': {
+    allowedRoles: ['ecosystem-reader'],
+    defaultRoles: ['ecosystem-reader'],
+    allowedAudiences: ['tantra-bridge'],
+    defaultAudience: 'tantra-bridge'
+  }
+};
+
 app.get('/health', (req, res) => {
   res.json({ service: 'sarathi', status: 'healthy', issuer: ISSUER, algorithms: ['RS256', 'EdDSA'] });
 });
@@ -97,6 +125,36 @@ app.post('/token', (req, res) => {
     return res.status(400).json({ error: 'trace_id and execution_id required' });
   }
 
+  const actor = req.body.actor || req.body.sub || 'tantra-execution';
+  const policy = TRUSTED_SERVICE_POLICIES[actor];
+  if (!policy) {
+    log(trace_id, execution_id, 'sarathi', 'error', `Untrusted service principal: ${actor}`);
+    return res.status(403).json({ error: `Untrusted service principal: ${actor}` });
+  }
+
+  // Caller cannot escalate privileges. If roles are explicitly supplied, they must be a subset of allowedRoles.
+  let roles = policy.defaultRoles;
+  if (Array.isArray(req.body.roles)) {
+    const unauthorizedRoles = req.body.roles.filter(r => !policy.allowedRoles.includes(r));
+    if (unauthorizedRoles.length > 0) {
+      log(trace_id, execution_id, 'sarathi', 'error', `Privilege escalation attempt rejected for ${actor}: ${unauthorizedRoles.join(', ')}`);
+      return res.status(403).json({
+        error: `Privilege escalation denied: unauthorized roles requested for principal '${actor}': ${unauthorizedRoles.join(', ')}`
+      });
+    }
+    roles = req.body.roles;
+  }
+
+  // Audience validation
+  const requestedAudience = req.body.audience || req.body.aud || policy.defaultAudience;
+  if (!policy.allowedAudiences.includes(requestedAudience)) {
+    log(trace_id, execution_id, 'sarathi', 'error', `Unauthorized audience: ${requestedAudience}`);
+    return res.status(400).json({
+      error: `Invalid or unauthorized audience '${requestedAudience}' for principal '${actor}'`
+    });
+  }
+  const audience = requestedAudience;
+
   const jti = crypto.randomUUID();
   const expiryMs = Date.now() + (parseInt(process.env.JWT_EXPIRY_MS) || 3600000);
 
@@ -106,8 +164,11 @@ app.post('/token', (req, res) => {
   const claims = {
     trace_id,
     execution_id,
+    actor,
+    sub: actor,
+    roles,
     iss: ISSUER,
-    aud: 'tantra-bridge',
+    aud: audience,
     jti,
     iat,
     exp
@@ -118,10 +179,7 @@ app.post('/token', (req, res) => {
   }
 
   if (algo === 'RS256') {
-    const token = jwt.sign(claims, RSA_PRIVATE_KEY, {
-      algorithm: 'RS256',
-      keyid: rsaKid
-    });
+    const token = signRS256Token(claims, rsaKid);
     tokenCache.set(jti, expiryMs);
     log(trace_id, execution_id, 'sarathi', 'success', `RS256 token issued with jti: ${jti}`);
     return res.json({ token, trace_id, execution_id, jti, algorithm: 'RS256' });
@@ -150,9 +208,12 @@ app.get('/.well-known/jwks.json', (req, res) => {
   res.json({ keys: [ed25519Jwk, rsaJwk] });
 });
 
-const server = app.listen(PORT, () => {
-  log(null, null, 'sarathi', 'info', `Sarathi Authority Service running on port ${PORT}`);
-});
+let server = null;
+if (require.main === module) {
+  server = app.listen(PORT, () => {
+    log(null, null, 'sarathi', 'info', `Sarathi Authority Service running on port ${PORT}`);
+  });
+}
 
 function gracefulShutdown(signal) {
   log(null, null, 'sarathi', 'info', `Received ${signal}, shutting down gracefully`);
@@ -169,3 +230,5 @@ function gracefulShutdown(signal) {
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+module.exports = { app, server, TRUSTED_SERVICE_POLICIES };
