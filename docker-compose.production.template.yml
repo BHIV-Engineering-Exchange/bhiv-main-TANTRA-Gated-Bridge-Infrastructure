@@ -127,6 +127,11 @@ services:
       - NODE_ENV=production
       - PORT=3003
       - SARATHI_URL=http://tantra-sarathi:3001
+      - BUCKET_URL=http://tantra-bucket:3004
+      - MASTERDB_URL=${MASTERDB_URL:-https://bhiv-masterdb-ingestion-certification.onrender.com}
+      - VAJRA_URL=${VAJRA_URL:-http://blackhole-node-1:8080}
+      - VAJRA_TANTRA_SECRET=${VAJRA_TANTRA_SECRET:-}
+      - VAJRA_PROVENANCE_ENABLED=${VAJRA_PROVENANCE_ENABLED:-false}
     volumes:
       - execution-outputs:/app/execution/outputs
     networks:

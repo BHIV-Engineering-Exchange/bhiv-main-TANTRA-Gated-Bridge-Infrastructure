@@ -2,8 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const axios = require('axios');
 const path = require('path');
+const axios = require('axios');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./swagger');
 const replayHooks = require('../observability/replay_hooks');
@@ -79,8 +79,10 @@ function verifyEdDSAToken(token, jwk) {
   return payload;
 }
 
+
+
 const validateBridgeSignature = async (req, res, next) => {
-  const bridgeSignature = req.body.bridge_signature;
+  const bridgeSignature = req.body.bridge_signature || req.headers.authorization;
   if (!bridgeSignature) {
     log.error('Missing bridge signature', { service: 'execution', status: 'error', trace_id: null, execution_id: null });
     return res.status(401).json({ error: 'Unauthorized: Missing bridge signature' });
@@ -89,12 +91,13 @@ const validateBridgeSignature = async (req, res, next) => {
   try {
     const token = bridgeSignature.replace('Bearer ', '');
 
-    const decodedHeader = jwt.decode(token, { complete: true });
-    if (!decodedHeader || !decodedHeader.header) {
-      throw new Error('Failed to decode JWT header');
+    const parts = token.split('.');
+    if (parts.length !== 3) {
+      throw new Error('Failed to decode JWT header: invalid token format');
     }
-    const kid = decodedHeader.header.kid;
-    const alg = decodedHeader.header.alg;
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+    const kid = header.kid;
+    const alg = header.alg;
 
     const keys = await fetchJwks();
     const jwk = resolveJwk(keys, kid);
@@ -129,8 +132,16 @@ const enforceImmutableIds = (req, res, next) => {
   const tokenTraceId = req.bridgeTokenData.trace_id;
   const tokenExecutionId = req.bridgeTokenData.execution_id;
 
-  if (req.body.trace_id !== tokenTraceId || req.body.execution_id !== tokenExecutionId) {
-    log.error('ID mutation detected', { service: 'execution', status: 'error', trace_id: tokenTraceId, execution_id: tokenExecutionId });
+  const bodyTraceId = req.body.trace_id || req.headers['x-sarathi-trace-id'];
+  const bodyExecutionId = req.body.execution_id || req.headers['x-sarathi-execution-id'];
+
+  if (!bodyTraceId || bodyTraceId !== tokenTraceId) {
+    log.error('ID mutation detected (trace_id missing or mismatched)', { service: 'execution', status: 'error', trace_id: tokenTraceId, execution_id: tokenExecutionId });
+    return res.status(400).json({ error: 'ID mutation forbidden' });
+  }
+
+  if (!bodyExecutionId || bodyExecutionId !== tokenExecutionId) {
+    log.error('ID mutation detected (execution_id missing or mismatched)', { service: 'execution', status: 'error', trace_id: tokenTraceId, execution_id: tokenExecutionId });
     return res.status(400).json({ error: 'ID mutation forbidden' });
   }
 
@@ -254,7 +265,7 @@ app.get('/health', (req, res) => {
  *               trace_id: a71bf018-cde6-4ef2-bafe-b11de9ecd68b
  *               execution_id: c6e0eece-45d5-4cdc-bfc5-6c9c46ad4426
  */
-app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) => {
+app.post(['/run', '/execute'], validateBridgeSignature, enforceImmutableIds, async (req, res) => {
   const { trace_id, execution_id } = req;
   const { workload } = req.body;
 
@@ -263,7 +274,9 @@ app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) 
 
   try {
     const startTime = Date.now();
-    const result = await executeWorkload(workload, trace_id, execution_id);
+    const rawSignature = req.body.bridge_signature || req.headers.authorization;
+    const token = rawSignature ? rawSignature.replace(/^Bearer\s+/i, '') : null;
+    const result = await executeWorkload(workload, trace_id, execution_id, { token, bridgeTokenData: req.bridgeTokenData });
     const duration = Date.now() - startTime;
 
     const artifactTimestamp = new Date().toISOString();
@@ -315,36 +328,50 @@ app.post('/run', validateBridgeSignature, enforceImmutableIds, async (req, res) 
   }
 });
 
-async function executeWorkload(workload, trace_id, execution_id) {
+app.use((req, res, next) => {
+  if (req.path.startsWith('/docs')) return next();
+  res.status(404).json({ error: `Not Found: ${req.method} ${req.path} is not a valid route on execution service` });
+});
+
+async function executeWorkload(workload, trace_id, execution_id, context = {}) {
   const participantPath = process.env.EXECUTION_PARTICIPANT;
   if (participantPath) {
     try {
       const participant = require(path.resolve(participantPath));
-      return await participant.executeWorkload(workload, trace_id, execution_id);
+      return await participant.executeWorkload(workload, trace_id, execution_id, context);
     } catch (err) {
       log.error(`Execution participant failed: ${err.message}`, { service: 'execution', status: 'error', trace_id, execution_id });
       throw err;
     }
   }
   const defaultParticipant = require('./execution_participant');
-  return defaultParticipant.executeWorkload(workload, trace_id, execution_id);
+  return defaultParticipant.executeWorkload(workload, trace_id, execution_id, context);
 }
 
-const server = app.listen(PORT, () => {
-  log.info(`Execution Service running on port ${PORT}`, { service: 'execution', status: 'info', trace_id: null, execution_id: null });
-});
+let server = null;
+if (require.main === module) {
+  server = app.listen(PORT, () => {
+    log.info(`Execution Service running on port ${PORT}`, { service: 'execution', status: 'info', trace_id: null, execution_id: null });
+  });
+}
 
 function gracefulShutdown(signal) {
   log.info(`Received ${signal}, shutting down gracefully`, { service: 'execution', status: 'info', trace_id: null, execution_id: null });
-  server.close(() => {
-    log.info('Server closed', { service: 'execution', status: 'info', trace_id: null, execution_id: null });
+  if (server) {
+    server.close(() => {
+      log.info('Server closed', { service: 'execution', status: 'info', trace_id: null, execution_id: null });
+      process.exit(0);
+    });
+    setTimeout(() => {
+      log.warn('Forced shutdown after timeout', { service: 'execution', status: 'warn', trace_id: null, execution_id: null });
+      process.exit(1);
+    }, 5000);
+  } else {
     process.exit(0);
-  });
-  setTimeout(() => {
-    log.warn('Forced shutdown after timeout', { service: 'execution', status: 'warn', trace_id: null, execution_id: null });
-    process.exit(1);
-  }, 5000);
+  }
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+module.exports = { app, server, executeWorkload };
